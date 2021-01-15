@@ -11,8 +11,8 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_HMC5883_U.h>
 
-#define VERBOSE   1
-#define REPORT    1
+#define VERBOSE   0
+#define REPORT    0
 #define TIMING    1
 #define ERROR_MSG 1
 
@@ -54,12 +54,16 @@ unsigned int ecgValue = 0;
 bool alert_button = false;
 
 const int  Interval_High  = 1;      //through delay
+const int     Check_High  = 1;      //unused
       int      Last_High  = 0;      //unused
 const int  Interval_Med   = 200;
+const int     Check_Med   = 50;
       long     Last_Med   = 0;
 const int  Interval_Low   = 5000;
+const int     Check_Low   = 1000;
       long     Last_Low   = 0;
       int  Interval_Chart = 20;
+      int     Check_Chart = 7;
       long     Last_Chart = 0;
 
 int i = 0;
@@ -93,17 +97,26 @@ TaskHandle_t xHandle_get_Low = NULL;
 unsigned long micro_align = 0;
 unsigned long micros_tt[10] = {0,0,0,0,0,0,0,0,0,0};
 
-byte sample_H[10];
-byte sample_M[10];
-byte sample_L[21];
+DateTime lastClock;
+unsigned long lastClock_us = 0;
 
-bool I2C1_inuse = false;
+const int H_data_length = 10;
+byte sample_H[H_data_length];
+const int M_data_length = 30;
+byte sample_M[M_data_length];
+const int L_data_length = 21;
+byte sample_L[L_data_length];
+
+bool I2C1_inuse   = false;
+bool I2C2_inuse   = false;
+bool fileIO_inuse = false;
 
 typedef struct {
     File file;
     long bytes_written;
     DateTime created;
     DateTime created_ref;
+    long created_millis;
     long created_micro;
     long limit_bytes;
     unsigned int limit_seconds;
@@ -111,8 +124,19 @@ typedef struct {
 
 out_file out_files[3]; //0 = High, 1 = Med, 2 = Low
 
-DateTime get_clock(void) {
-  return DS3231M.now();
+DateTime get_clock(bool will_wait) {
+  if (I2C2_inuse) {
+    if (will_wait) {while (I2C2_inuse) {delay(1);}}
+    else {
+      if ((micros()-lastClock_us)<25000) {return lastClock;}
+      else {while (I2C2_inuse) {delay(1);}}
+    }
+  }
+  I2C2_inuse = true;
+  lastClock = DS3231M.now();
+  I2C2_inuse = false;
+  lastClock_us = micros();
+  return lastClock;
 }
 
 DateTime timenow;
@@ -151,26 +175,36 @@ void open_file(byte fn) {
     SO(VERBOSE,"Opening new file",0);
     SO(VERBOSE,String(fn),0);
     SO(VERBOSE," : ",0);
-    DateTime filenow = get_clock();
+    DateTime filenow = get_clock(true);
     char speed = fn ? ((fn == 1) ? 'M' : 'L') : 'H';
     char * filename = get_filename(filenow,speed);
     SO(VERBOSE,filename);
-    out_files[0].file = SD.open(filename, FILE_WRITE);
-    out_files[0].bytes_written = 0;
-    out_files[0].created = filenow;
-    out_files[0].created_ref = DateTime(
+    while (fileIO_inuse) {delay(1);};
+    fileIO_inuse = true;
+    out_files[fn].file = SD.open(filename, FILE_WRITE);
+    fileIO_inuse = false;
+    if (!out_files[fn].file) {SO(ERROR_MSG,"ERROR - can't open new File",0); SO(VERBOSE,String(fn));}
+    out_files[fn].bytes_written = 0;
+    out_files[fn].created = filenow;
+    out_files[fn].created_ref = DateTime(
             filenow.year(), filenow.month() , filenow.day(),
             filenow.hour(), filenow.minute(), 0);
-    out_files[0].created_micro = micros();
+    out_files[fn].created_millis = millis();
+    out_files[fn].created_micro = micros();
     SO(TIMING,"  Time: ",0);
     SO(TIMING,String(tt(1)),0);
     SO(TIMING," us");
 }
 
 void file_write(byte fn, const unsigned char * data_packet, unsigned long data_length, bool time_sens = false) {
-    out_files[fn].file.write(data_packet, data_length);
+    while (fileIO_inuse) {delay(1);};
+    fileIO_inuse = true;
+    int bytes = out_files[fn].file.write(data_packet, data_length);
+    fileIO_inuse = false;
     out_files[fn].bytes_written += data_length;
     
+    SO(VERBOSE,String(bytes),0);
+    SO(VERBOSE,"/",0);
     SO(VERBOSE,String(data_length),0);
     SO(VERBOSE," Bytes Written to File",0);
     SO(VERBOSE,String(fn),0);
@@ -181,10 +215,14 @@ void file_write(byte fn, const unsigned char * data_packet, unsigned long data_l
         
     if ((
         (out_files[fn].bytes_written >= out_files[fn].limit_bytes) ||
-        ((get_clock() - out_files[fn].created).totalseconds() >= out_files[fn].limit_seconds)) &&
+        ((millis() - out_files[fn].created_millis) >= ((long)out_files[fn].limit_seconds*1000))) &&
         !time_sens) {
+          while (fileIO_inuse) {delay(1);};
+          fileIO_inuse = true;
           out_files[0].file.close();
+          fileIO_inuse = false;
           open_file(fn);
+          
     }
 }
 
@@ -211,8 +249,8 @@ void setup() {
     bDelay1.attachPop(bDelay1Callback, &bDelay1);
     bDelay0.attachPop(bDelay0Callback, &bDelay0);   
 
-      DS3231M.adjust(DateTime(2021, 1, 12, 2, 8, 40)); delay(2000);
-    DateTime check = get_clock();
+      //DS3231M.adjust(DateTime(2021, 1, 15, 16, 47, 20)); delay(2000);
+    DateTime check = get_clock(true);
     SO_clock(VERBOSE, check);
 
     out_files[0].limit_bytes   = 125000;
@@ -246,7 +284,7 @@ void update_chart(void * params) {
     s0.addValue(2, map(Red/100, 1450,1550,0,200));
     //while(1){delay(1);}
     }
-    delay(7);
+    delay(Check_Chart);
   }
 }
 
@@ -254,6 +292,7 @@ void get_Med(void * params) {
   while(1){
   if ((millis() - Last_Med) > Interval_Med) {
     while (I2C1_inuse) {delay(1);};
+    long micro_before = micros();
     I2C1_inuse = true;
     Last_Med = millis();
     get_acc();
@@ -262,9 +301,61 @@ void get_Med(void * params) {
     //SO(TIMING,"T: to mag   = ",0); SO(TIMING,String(tt(0)));
     I2C1_inuse = false;
     //file_write(1, sample_M, 10);
+
+    unsigned int seconds_diff = (get_clock(false) - out_files[1].created_ref).totalseconds();
+
+    byte magx[4];
+    *(float*)(magx)  = mag_event.magnetic.x;
+    byte magy[4];
+    *(float*)(magy)  = mag_event.magnetic.y;
+    byte magz[4];
+    *(float*)(magz)  = mag_event.magnetic.z;
+    byte head[4];
+    *(float*)(head)  = headingDegrees;
+    byte pitch[4];
+    *(float*)(pitch) = pitchDegrees;
     
+    sample_M[0]  = (byte)(seconds_diff >> 2);
+    sample_M[1]  = (byte)((byte)(seconds_diff << 6) | ((byte)(micro_before >> 16) & B00111111));
+    sample_M[2]  = (byte)(micro_before >> 8);
+    sample_M[3]  = (byte)(micro_before);
+    
+    sample_M[4]  = (byte)(highByte(acc_x));
+    sample_M[5]  = (byte)(lowByte(acc_x));
+    sample_M[6]  = (byte)(highByte(acc_y));
+    sample_M[7]  = (byte)(lowByte(acc_y));
+    sample_M[8]  = (byte)(highByte(acc_z));
+    sample_M[9]  = (byte)(lowByte(acc_z));
+
+    sample_M[10] = (byte)(magx[0]);
+    sample_M[11] = (byte)(magx[1]);
+    sample_M[12] = (byte)(magx[2]);
+    sample_M[13] = (byte)(magx[3]);
+
+    sample_M[14] = (byte)(magy[0]);
+    sample_M[15] = (byte)(magy[1]);
+    sample_M[16] = (byte)(magy[2]);
+    sample_M[17] = (byte)(magy[3]);
+
+    sample_M[18] = (byte)(magz[0]);
+    sample_M[19] = (byte)(magz[1]);
+    sample_M[20] = (byte)(magz[2]);
+    sample_M[21] = (byte)(magz[3]);
+
+    sample_M[22] = (byte)(head[0]);
+    sample_M[23] = (byte)(head[1]);
+    sample_M[24] = (byte)(head[2]);
+    sample_M[25] = (byte)(head[3]);
+    
+    sample_M[26] = (byte)(pitch[0]);
+    sample_M[27] = (byte)(pitch[1]);
+    sample_M[28] = (byte)(pitch[2]);
+    sample_M[29] = (byte)(pitch[3]);
+
+    file_write(1, sample_M, M_data_length);
+
   }
-  delay(50);
+  delay(Check_Med);
   }
     //while(1){delay(1);}
     
@@ -290,8 +381,8 @@ void get_Low(void * params) {
         }
       }
     }
+    long micro_before = micros();
     I2C1_inuse = true;
-    //long micro_before = micros();
     //tt(6);
     get_BMP();
     //SO(TIMING,"T: to BMP   = ",0); SO(TIMING,String(tt(6)));
@@ -300,17 +391,14 @@ void get_Low(void * params) {
     get_button();
     //SO(TIMING,"T: to Butto   = ",0); SO(TIMING,String(tt(6)));
     
-/*
-    int seconds_diff = (out_files[0].created_ref - timenow).totalseconds();
+    unsigned int seconds_diff = (get_clock(false) - out_files[2].created_ref).totalseconds();
 
     byte Temperature_bytes[4];
     *(float*)(Temperature_bytes) = Temperature;
     byte Altitude_bytes[4];
     *(float*)(Altitude_bytes) = Altitude;
     byte RealAltitude_bytes[4];
-    *(float*)(RealAltitude_bytes) = RealAltitude`;
-
-    int32_t Pressure;
+    *(float*)(RealAltitude_bytes) = RealAltitude;
     
     sample_L[0]  = (byte)(seconds_diff >> 2);
     sample_L[1]  = (byte)((byte)(seconds_diff << 6) | ((byte)(micro_before >> 16) & B00111111));
@@ -339,10 +427,10 @@ void get_Low(void * params) {
 
     sample_L[20] = (byte)(alert_button);   
     
-    file_write(2, sample_L, 21);
-    */
+    file_write(2, sample_L, L_data_length);
+    
     }
-    delay(1000);
+    delay(Check_Low);
     }
     //while(1){delay(1);}
 }
@@ -353,7 +441,7 @@ void loop(void) {
 
     
     SO(TIMING,"T: to Start = ",0); SO(TIMING,String(tt(0)));
-    timenow = get_clock();
+    timenow = get_clock(true);
     SO_clock(REPORT, timenow);
     long micro_before = micros();
     SO(TIMING,"T: to Clock = ",0); SO(TIMING,String(tt(0)));
@@ -362,7 +450,7 @@ void loop(void) {
     get_MAX();
     SO(TIMING,"T: to MAX   = ",0); SO(TIMING,String(tt(0)));
 
-    int seconds_diff = (out_files[0].created_ref - timenow).totalseconds();
+    unsigned int seconds_diff = (timenow - out_files[0].created_ref).totalseconds();
     
     sample_H[0] = (byte)(seconds_diff >> 2);
     sample_H[1] = (byte)((byte)(seconds_diff << 6) | ((byte)(micro_before >> 16) & B00111111));
@@ -446,7 +534,7 @@ void loop(void) {
     }
     */
 
-    file_write(0, sample_H, 10);
+    file_write(0, sample_H, H_data_length);
     SO(TIMING,"T: to SaveF   = ",0); SO(TIMING,String(tt(0)));
 
 
@@ -494,10 +582,10 @@ void get_BMP(void) {
 }
 
 void get_MAX(void) {
-    
-    particleSensor.check(); //Check the sensor, read up to 3 samples
-    
-    
+
+    while (I2C2_inuse) {delay(1);}
+    I2C2_inuse = true;
+    particleSensor.check(); //Check the sensor, read up to 3 samples   
     while (particleSensor.available()) {
         SO(1,"MAX: Data Available");
         Red = particleSensor.getFIFOIR(); //why getFIFOIR output Red data by MAX30102 on MH-ET LIVE breakout board
@@ -505,8 +593,8 @@ void get_MAX(void) {
         process_particle();
         particleSensor.nextSample();
     }
+    I2C2_inuse = false;
     
-
     //particleSensor.check(); //Check the sensor, read up to 3 samples
     //if (particleSensor.available()) {
     //    Red = particleSensor.getIR(); //why getFIFOIR output Red data by MAX30102 on MH-ET LIVE breakout board
